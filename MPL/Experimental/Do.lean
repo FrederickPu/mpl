@@ -95,14 +95,14 @@ def invariantGadget1.{u} {m : Type → Type u} {ps : PostShape} [Monad m] [WP m 
   pure ()
 
 -- This one will have the let mut vars as bound occurrences in β
-def invariantGadget2.{u,v} {β : Type v} {m : Type → Type u} {ps : PostShape} [Monad m] [WP m ps] (_inv : β → {α : Type} → {xs:List α} → List.Zipper xs → Assertion ps) : m Unit :=
+def invariantGadget2.{u,v} {α : Type} {β : Type v} {m : Type → Type u} {ps : PostShape} [Monad m] [WP m ps] {xs : List α} (_inv : β → List.Zipper xs → Assertion ps) : m Unit :=
   pure ()
 
 @[spec]
 theorem Specs.invariantGadget_list {m : Type → Type u₂} {ps : PostShape} {α : Type} {β γ : Type} [Monad m] [WPMonad m ps]
   (xs : List α) (init : β) (f : α → β → m (ForInStep β)) (inv : β → {α : Type} → {xs : List α} → List.Zipper xs → Assertion ps) (k : β → m γ) (Q : PostCond γ ps):
   ⦃wp⟦(do let r ← MPL.forInWithInvariant_list xs init f (PostCond.total fun p => (inv p.1 p.2)); k r)⟧ Q⦄
-  (do (invariantGadget2 inv : m Unit); let r ← forIn xs init f; k r)
+  (do (invariantGadget2 (fun b => @inv b α xs): m Unit); let r ← forIn xs init f; k r)
   ⦃Q⦄ := by
     unfold invariantGadget2 MPL.forInWithInvariant_list
     simp only [pure_bind]
@@ -112,7 +112,7 @@ theorem Specs.invariantGadget_list {m : Type → Type u₂} {ps : PostShape} {α
 theorem Specs.invariantGadget_range {m : Type → Type u₂} {ps : PostShape} {β γ : Type} [Monad m] [WPMonad m ps]
   (xs : Std.Range) (init : β) (f : Nat → β → m (ForInStep β)) (inv : β → {α : Type} → {xs : List α} → List.Zipper xs → Assertion ps) (k : β → m γ) (Q : PostCond γ ps):
   ⦃wp⟦(do let r ← MPL.forInWithInvariant_range xs init f (PostCond.total fun p => (inv p.1 p.2)); k r)⟧ Q⦄
-  (do (invariantGadget2 inv : m Unit); let r ← forIn xs init f; k r)
+  (do (invariantGadget2 (fun b => @inv b _ xs.toList) : m Unit); let r ← forIn xs init f; k r)
   ⦃Q⦄ := by
     unfold invariantGadget2 MPL.forInWithInvariant_range
     simp only [pure_bind]
@@ -177,6 +177,7 @@ def patch_invariant (e : Expr) (args : Array Expr := Array.empty) (names : Array
 --      dbg_trace "go"
       let mut bvshift := 0
       let mut body := args[0]!
+      let mut lst : Expr := default
       while true do
         if let .letE _ _ _ b _ := body then
           body := b
@@ -186,9 +187,10 @@ def patch_invariant (e : Expr) (args : Array Expr := Array.empty) (names : Array
       body := b
       bvshift := bvshift + 1
       while true do
-        if let some init := (match_expr body with | ForIn.forIn _ _ _ _ _ _ _ init _ => some init | _ => none) then
+        if let some (xs, init) := (match_expr body with | ForIn.forIn _ _ _ _ _ _ xs init _ => some (xs, init) | _ => none) then
           -- init contains the good stuff; a tuple of all the mut vars
           body := init
+          lst := xs
           break
         else if let .letE _ _ _ b _ := body then
           body := b
@@ -200,6 +202,12 @@ def patch_invariant (e : Expr) (args : Array Expr := Array.empty) (names : Array
         else throwError "bfoo"
       let mut prod := body
       let prod_ty0 ← inferType prod -- This inferType is currently the only reason we need TermElabM. We can likely reconstruct the type from the match on MProd.mk below to make it pure...
+      IO.println f!"{← ppExpr lst}"
+      let lst_ty ← inferType lst
+      let lst_ty0 := match lst_ty with
+                    | Expr.app (Expr.const `List _) α  =>
+                      α
+                    | _ => panic! "Not a List type"
       let .succ v ← getLevel prod_ty0 | throwError "Cannot happen; Prop-sorted MProd"
 --      dbg_trace prod_ty0
       let mut prod_ty := prod_ty0
@@ -236,12 +244,18 @@ def patch_invariant (e : Expr) (args : Array Expr := Array.empty) (names : Array
       for i in [0:mut_vars.size] do
         subst := subst.set! mut_vars[i]! (.bvar ((mut_vars.size - i - 1) * 2))
 --      dbg_trace subst
+
       let inv := inv.instantiate subst
+      -- let inv := mkApp2 inv lst_ty lst -- remove implicit types
+      let inv := mkApp2 inv lst_ty0 lst
+      logInfo lst
+      IO.println s!"askdaskldj {← ppExpr (← inferType inv)}"
       let inv := wrapper inv
+      IO.println s!"bbl {← ppExpr (← inferType inv)}"
 --      dbg_trace inv
 --      logInfo inv
 --      logInfo (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp6 (mkConst ``invariantGadget2 [u,v]) prod_ty0 m ps monad wp inv)))
-      pure (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp6 (mkConst ``invariantGadget2 [u,v]) prod_ty0 m ps monad wp inv)))
+      pure (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp8 (mkConst ``invariantGadget2 [u,v]) lst_ty0 prod_ty0 m ps monad wp lst inv)))
     | _ => pure (mkAppRev (Expr.const n ls) args)
   | _, _ => pure (mkAppRev (Expr.const n ls) args)
 -- the congruent cases:
@@ -314,14 +328,14 @@ partial def elab_newdecl : CommandElab := fun decl => do
   -- Step 2: Rewrite invariantGadget1 to invariantGadget2, thus closing over the let mut vars
 --  log defn.value
   runTermElabM fun _ => do
-    let newval ← patch_invariant defn.value
---    synthesizeSyntheticMVarsNoPostponing
---    let newval ← instantiateMVars newval
---    log newval
-    addDecl (.defnDecl { defn with
-      name := refinedDeclId2
-      value := newval
-    })
+    lambdaTelescope defn.value fun fvars body => do
+      let newBody ← patch_invariant body
+      let finalBody ← mkLambdaFVars fvars newBody
+      addDecl (.defnDecl { defn with
+        name := refinedDeclId2
+        value := finalBody
+      })
+
   let .some (.defnInfo defn) := (← getEnv).find? refinedDeclId2 | throwUnsupportedSyntax
 --  dbg_trace defn.name
 --  dbg_trace defn.value
@@ -366,55 +380,54 @@ partial def elab_newdecl : CommandElab := fun decl => do
   let (refined_spec, erased_value) ← spec_ty (mkConst defn.name (defn.levelParams.map .param)) defn.value numProgBinders defn.type
   let erased_value ← instantiateMVars erased_value
   let erased_ty ← inferType erased_value
-  -- dbg_trace erased_value
-  -- dbg_trace erased_ty
-  --log erased_value
-  withOptions (Elab.async.set · false) <|
-    addDecl (.defnDecl { defn with
-      name := declId
-      type := erased_ty
-      -- value := ← Term.elabTermEnsuringType (← `(by sorry)) refined_spec
-      value := erased_value
-    })
-  let .some (.defnInfo defn) := (← getEnv).find? declId | throwUnsupportedSyntax
-  enableRealizationsForConst defn.name
-  -- dbg_trace defn.name
-  synthesizeSyntheticMVarsNoPostponing
-  let refined_spec ← instantiateMVars refined_spec
-  let rec erase_spec (erased_call : Expr) (progBinders : Nat) : Expr → TermElabM Expr
-    | .forallE x ty refined_spec info => withLocalDecl x info ty fun a => do
---      dbg_trace x
---      dbg_trace progBinders
-      let erased_spec ← erase_spec (if progBinders = 0 then erased_call else mkApp erased_call a) (progBinders - 1) (refined_spec.instantiate1 a)
-      return (← mkForallFVars #[a] erased_spec)
-    | mkApp3 trpl _refined_call P Q => do
-      -- dbg_trace _refined_call
-      return (mkApp3 trpl erased_call P Q)
-    | _ => throwError "no triple"
-  --log refined_spec
-  let erased_spec ← erase_spec (mkConst defn.name) numProgBinders refined_spec
-  -- dbg_trace erased_spec
-  let levelParams := collectLevelParams {} erased_spec |>.params
-  -- dbg_trace levelParams
 
---  let refined_spec ← instantiateMVars (← spec_ty (← mkConstWithFreshMVarLevels defn.name) defn.type)
-  let val := (← Term.elabTerm (← `(by unfold $(mkIdent refinedDeclId2); intros; mvcgen <;> repeat crush)) (.some refined_spec) (catchExPostpone := false))
-  synthesizeSyntheticMVarsNoPostponing
-  let erased_spec ← instantiateMVars erased_spec
-  let val ← instantiateMVars val
---  dbg_trace refined_spec.hasLevelMVar
---  dbg_trace refined_spec.hasMVar
---  dbg_trace erased_spec.hasLevelMVar
---  dbg_trace erased_spec.hasMVar
---  dbg_trace val.hasLevelMVar
---  dbg_trace val.hasMVar
-  addDecl (.thmDecl {
-    name := declId ++ Name.mkSimple "spec"
-    levelParams := defn.levelParams
-    type := erased_spec
-    -- value := ← Term.elabTermEnsuringType (← `(by sorry)) refined_spec
-    value := val
-  })
+  --log erased_value
+  -- withOptions (Elab.async.set · false) <|
+  --   addDecl (.defnDecl { defn with
+  --     name := declId
+  --     type := erased_ty
+  --     -- value := ← Term.elabTermEnsuringType (← `(by sorry)) refined_spec
+  --     value := erased_value
+  --   })
+--   let .some (.defnInfo defn) := (← getEnv).find? declId | throwUnsupportedSyntax
+--   enableRealizationsForConst defn.name
+--   -- dbg_trace defn.name
+--   synthesizeSyntheticMVarsNoPostponing
+--   let refined_spec ← instantiateMVars refined_spec
+--   let rec erase_spec (erased_call : Expr) (progBinders : Nat) : Expr → TermElabM Expr
+--     | .forallE x ty refined_spec info => withLocalDecl x info ty fun a => do
+-- --      dbg_trace x
+-- --      dbg_trace progBinders
+--       let erased_spec ← erase_spec (if progBinders = 0 then erased_call else mkApp erased_call a) (progBinders - 1) (refined_spec.instantiate1 a)
+--       return (← mkForallFVars #[a] erased_spec)
+--     | mkApp3 trpl _refined_call P Q => do
+--       -- dbg_trace _refined_call
+--       return (mkApp3 trpl erased_call P Q)
+--     | _ => throwError "no triple"
+--   --log refined_spec
+--   let erased_spec ← erase_spec (mkConst defn.name) numProgBinders refined_spec
+--   -- dbg_trace erased_spec
+--   let levelParams := collectLevelParams {} erased_spec |>.params
+--   -- dbg_trace levelParams
+
+-- --  let refined_spec ← instantiateMVars (← spec_ty (← mkConstWithFreshMVarLevels defn.name) defn.type)
+--   let val := (← Term.elabTerm (← `(by unfold $(mkIdent refinedDeclId2); intros; mvcgen <;> repeat crush)) (.some refined_spec) (catchExPostpone := false))
+--   synthesizeSyntheticMVarsNoPostponing
+--   let erased_spec ← instantiateMVars erased_spec
+--   let val ← instantiateMVars val
+-- --  dbg_trace refined_spec.hasLevelMVar
+-- --  dbg_trace refined_spec.hasMVar
+-- --  dbg_trace erased_spec.hasLevelMVar
+-- --  dbg_trace erased_spec.hasMVar
+-- --  dbg_trace val.hasLevelMVar
+-- --  dbg_trace val.hasMVar
+--   addDecl (.thmDecl {
+--     name := declId ++ Name.mkSimple "spec"
+--     levelParams := defn.levelParams
+--     type := erased_spec
+--     -- value := ← Term.elabTermEnsuringType (← `(by sorry)) refined_spec
+--     value := val
+--   })
 
 namespace Test
 
@@ -427,99 +440,101 @@ def fib_impl (n : Nat) : Idd Nat
   ensures r => r = fib_spec n
 := do
   if n = 0 then return 0
-  let mut a := 0
-  let mut b := 1
-  invariant xs => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1)
-  for _ in [1:n] do
-    let a' := a
-    a := b
-    b := a' + b
-  return b
+    let mut a := 0
+    let mut b := 1
+    invariant xs => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1)
+  for _ in List.range n do
+      let a' := a
+      a := b
+      b := a' + b
+    return b
 
+#print fib_impl.refined1
+#check fib_impl.refined2
 --#check fib_impl.spec
 
-theorem fib_triple : ⦃⌜True⌝⦄ fib_impl n ⦃⇓ r => r = fib_spec n⦄ := by
-  unfold fib_impl
-  mintro -
-  if h : n = 0 then simp [h] else
-  simp only [h, reduceIte]
-  mspec
-  mspec
-  mspec Specs.forIn_range ?inv ?step
-  case inv => exact PostCond.total fun (⟨a, b⟩, xs) => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1)
-  case pre1 => simp_all
-  case step => intros; intro _; simp_all
-  simp_all [Nat.sub_one_add_one]
+-- theorem fib_triple : ⦃⌜True⌝⦄ fib_impl n ⦃⇓ r => r = fib_spec n⦄ := by
+--   unfold fib_impl
+--   mintro -
+--   if h : n = 0 then simp [h] else
+--   simp only [h, reduceIte]
+--   mspec
+--   mspec
+--   mspec Specs.forIn_range ?inv ?step
+--   case inv => exact PostCond.total fun (⟨a, b⟩, xs) => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1)
+--   case pre1 => simp_all
+--   case step => intros; intro _; simp_all
+--   simp_all [Nat.sub_one_add_one]
 
-theorem fib_correct {n} : (fib_impl n).run = fib_spec n := by
-  generalize h : (fib_impl n).run = x
-  apply Idd.by_wp h
-  apply fib_impl.spec n True.intro
+-- theorem fib_correct {n} : (fib_impl n).run = fib_spec n := by
+--   generalize h : (fib_impl n).run = x
+--   apply Idd.by_wp h
+--   apply fib_impl.spec n True.intro
 
-def fib_impl_strange (n : Nat) : Idd Nat
-  ensures r => r = fib_spec n
-:= do
-  if n = 0 then return 0
-  let mut a := 0
-  let mut b := 1
-  let c := 13
-  let d := 14
-  let mut e := 4
-  invariant xs => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1) ∧ c = 13 ∧ d = 14
-  for _ in [1:n] do
-    let a' := a
-    a := b
-    b := a' + b
-    e := 4
-  return b
+-- def fib_impl_strange (n : Nat) : Idd Nat
+--   ensures r => r = fib_spec n
+-- := do
+--   if n = 0 then return 0
+--   let mut a := 0
+--   let mut b := 1
+--   let c := 13
+--   let d := 14
+--   let mut e := 4
+--   invariant xs => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1) ∧ c = 13 ∧ d = 14
+--   for _ in [1:n] do
+--     let a' := a
+--     a := b
+--     b := a' + b
+--     e := 4
+--   return b
 
-private abbrev st : SVal ((Nat × Nat)::σs) (Nat × Nat) := fun s => SVal.pure s
+-- private abbrev st : SVal ((Nat × Nat)::σs) (Nat × Nat) := fun s => SVal.pure s
 
-def mkFreshInt {m : Type → Type} [Monad m] : StateT (Nat × Nat) m Nat
-  forall {ps} [WPMonad m ps] (n o : Nat)
-  requires => ⌜(#st).1 = n ∧ (#st).2 = o⌝
-  ensures r => ⌜r = n ∧ (#st).1 = n + 1 ∧ (#st).2 = o⌝
-:= do
-  let n ← Prod.fst <$> get
-  -- assert _ => ⌜o = 13⌝
-  modify (fun s => (s.1 + 1, s.2))
-  pure n
+-- def mkFreshInt {m : Type → Type} [Monad m] : StateT (Nat × Nat) m Nat
+--   forall {ps} [WPMonad m ps] (n o : Nat)
+--   requires => ⌜(#st).1 = n ∧ (#st).2 = o⌝
+--   ensures r => ⌜r = n ∧ (#st).1 = n + 1 ∧ (#st).2 = o⌝
+-- := do
+--   let n ← Prod.fst <$> get
+--   -- assert _ => ⌜o = 13⌝
+--   modify (fun s => (s.1 + 1, s.2))
+--   pure n
 
-/- signals is not implemented yet
---set_option trace.Elab.definition true in
-def blah1 (n: Nat) : StateM Nat Bool
-  requires s => s > 4
-  ensures r s => r = (n + s % 2 == 0)
-  signals _ _ => False
-:= do
-  if n == 0 then return false
-  let tmp := (← get) + n
-  assert _ => tmp > n
-  let mut x := 0
-  invariant xs _s => x = xs.rpref.sum
-  for i in [1:tmp] do
-    x := x + i
-  return (tmp % 2 == 0)
--- specification_by
---   · xwp; sorry
---   · inv x (rpref, y::suff) → inv (x + i) (y::rpref,suff)
---   · Q <return false>
---   · Q <return (tmp % 2 == 0)>
+-- /- signals is not implemented yet
+-- --set_option trace.Elab.definition true in
+-- def blah1 (n: Nat) : StateM Nat Bool
+--   requires s => s > 4
+--   ensures r s => r = (n + s % 2 == 0)
+--   signals _ _ => False
+-- := do
+--   if n == 0 then return false
+--   let tmp := (← get) + n
+--   assert _ => tmp > n
+--   let mut x := 0
+--   invariant xs _s => x = xs.rpref.sum
+--   for i in [1:tmp] do
+--     x := x + i
+--   return (tmp % 2 == 0)
+-- -- specification_by
+-- --   · xwp; sorry
+-- --   · inv x (rpref, y::suff) → inv (x + i) (y::rpref,suff)
+-- --   · Q <return false>
+-- --   · Q <return (tmp % 2 == 0)>
 
 
-def foo := 1
+-- def foo := 1
 
-def ex (n : Nat) : ExceptT Nat (StateT Nat Idd) Nat
-  requires s => s = 4 ∧ n = 0
-  ensures (r:Nat) (s : Nat) => False
-  signals e s => e = 42 ∧ s = 4
-:= do
-  let mut x := n
-  let s ← get
-  --invariant s => True
-  for i in [1:s] do
-    x := x + i
-    if x > 4 then throw 42
-  set 1
-  return x
--/
+-- def ex (n : Nat) : ExceptT Nat (StateT Nat Idd) Nat
+--   requires s => s = 4 ∧ n = 0
+--   ensures (r:Nat) (s : Nat) => False
+--   signals e s => e = 42 ∧ s = 4
+-- := do
+--   let mut x := n
+--   let s ← get
+--   --invariant s => True
+--   for i in [1:s] do
+--     x := x + i
+--     if x > 4 then throw 42
+--   set 1
+--   return x
+-- -/
