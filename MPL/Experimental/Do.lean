@@ -10,10 +10,16 @@ import MPL.Specs
 import MPL.SPred.ProofMode
 import MPL.Experimental.Crush
 import MPL.Tactics.VCGen
+import Qq
 
 namespace MPL
 
 open Lean Parser Meta Elab Term Command
+open Qq
+
+set_option trace.compiler.ir.result true in
+
+def gadget1inv_to_gadget2inv (prod_ty0 : Q(Type)) (lst_ty0 : Q(Type)) (lst : Q(List $lst_ty0))  (ps : Q(PostShape)) (inv : Q($prod_ty0 → {α : Type} → {xs : List α} → List.Zipper $lst → Assertion $ps)) : Q(PostCond ($prod_ty0 × (List.Zipper $lst)) $ps) := q(⟨fun ⟨b, qq⟩ => @$inv b $lst_ty0 $lst qq, .const True⟩) -- unquoteExpr: ?m.108 : Expr
 
 def forInWithInvariant_list {m : Type → Type u₂} {α : Type} {β : Type} [Monad m]
   (xs : List α) (init : β) (f : α → β → m (ForInStep β)) {ps : PostShape} [WP m ps] (_inv : PostCond (β × List.Zipper xs) ps) : m β :=
@@ -95,24 +101,25 @@ def invariantGadget1.{u} {m : Type → Type u} {ps : PostShape} [Monad m] [WP m 
   pure ()
 
 -- This one will have the let mut vars as bound occurrences in β
-def invariantGadget2.{u,v} {α : Type} {β : Type v} {m : Type → Type u} {ps : PostShape} [Monad m] [WP m ps] {xs : List α} (_inv : β → List.Zipper xs → Assertion ps) : m Unit :=
+def invariantGadget2.{u} {α : Type} {β : Type} {m : Type → Type u} {ps : PostShape} [Monad m] [WP m ps] {xs : List α} (_inv : PostCond (β × List.Zipper xs) ps) : m Unit :=
   pure ()
 
 @[spec]
 theorem Specs.invariantGadget_list {m : Type → Type u₂} {ps : PostShape} {α : Type} {β γ : Type} [Monad m] [WPMonad m ps]
   (xs : List α) (init : β) (f : α → β → m (ForInStep β)) (inv : β → {α : Type} → {xs : List α} → List.Zipper xs → Assertion ps) (k : β → m γ) (Q : PostCond γ ps):
   ⦃wp⟦(do let r ← MPL.forInWithInvariant_list xs init f (PostCond.total fun p => (inv p.1 p.2)); k r)⟧ Q⦄
-  (do (invariantGadget2 (fun b => @inv b α xs): m Unit); let r ← forIn xs init f; k r)
+  (do (invariantGadget2 ⟨fun ⟨b, qq⟩ => @inv b α xs qq, .const True⟩ : m Unit); let r ← forIn xs init f; k r)
   ⦃Q⦄ := by
     unfold invariantGadget2 MPL.forInWithInvariant_list
     simp only [pure_bind]
     exact .rfl
 
+-- PostCondition definition: `(fun xxx => let b := Prod.fst xxx; let qq := Prod.snd xxx; @inv b _ xs.toList qq) (.const True))`
 @[spec 0]
 theorem Specs.invariantGadget_range {m : Type → Type u₂} {ps : PostShape} {β γ : Type} [Monad m] [WPMonad m ps]
   (xs : Std.Range) (init : β) (f : Nat → β → m (ForInStep β)) (inv : β → {α : Type} → {xs : List α} → List.Zipper xs → Assertion ps) (k : β → m γ) (Q : PostCond γ ps):
   ⦃wp⟦(do let r ← MPL.forInWithInvariant_range xs init f (PostCond.total fun p => (inv p.1 p.2)); k r)⟧ Q⦄
-  (do (invariantGadget2 (fun b => @inv b _ xs.toList) : m Unit); let r ← forIn xs init f; k r)
+  (do (invariantGadget2 (Prod.mk (fun xxx => let b := Prod.fst xxx; let qq := Prod.snd xxx; @inv b Nat xs.toList qq) (.const True)) : m Unit); let r ← forIn xs init f; k r)
   ⦃Q⦄ := by
     unfold invariantGadget2 MPL.forInWithInvariant_range
     simp only [pure_bind]
@@ -159,6 +166,7 @@ def newdefinition     := leading_parser
 def newdeclaration := leading_parser
   declModifiers false >> newdefinition
 
+#check BinderInfo
 --def newdeclaration.blah : TSyntax ``declVal → CommandElabM (TSyntax ``declVal)
 --  | `(newdeclVal| := $bdy:declBody $x $wheres $deriv:optDefDeriving) => do
 --def newdeclaration.toOldDeclaration : TSyntax ``newdeclaration → CommandElabM (TSyntax ``declaration)
@@ -201,7 +209,7 @@ def patch_invariant (e : Expr) (args : Array Expr := Array.empty) (names : Array
           continue
         else throwError "bfoo"
       let mut prod := body
-      let prod_ty0 ← inferType prod -- This inferType is currently the only reason we need TermElabM. We can likely reconstruct the type from the match on MProd.mk below to make it pure...
+      let prod_ty0 : Q(Type u) ← inferType prod -- This inferType is currently the only reason we need TermElabM. We can likely reconstruct the type from the match on MProd.mk below to make it pure...
       IO.println f!"{← ppExpr lst}"
       let lst_ty ← inferType lst
       let lst_ty0 := match lst_ty with
@@ -247,15 +255,15 @@ def patch_invariant (e : Expr) (args : Array Expr := Array.empty) (names : Array
 
       let inv := inv.instantiate subst
       -- let inv := mkApp2 inv lst_ty lst -- remove implicit types
-      let inv := mkApp2 inv lst_ty0 lst
+      -- PostCondition definition: `(fun xxx => let b := Prod.fst xxx; let qq := Prod.snd xxx; @inv b _ xs.toList qq) (.const True))`
+      let inv := wrapper inv
+      let inv := gadget1inv_to_gadget2inv prod_ty0 lst_ty0 lst ps inv
       logInfo lst
       IO.println s!"askdaskldj {← ppExpr (← inferType inv)}"
-      let inv := wrapper inv
-      IO.println s!"bbl {← ppExpr (← inferType inv)}"
---      dbg_trace inv
+      IO.println s!"askdaskldj {← ppExpr (← inferType inv)}"
 --      logInfo inv
---      logInfo (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp6 (mkConst ``invariantGadget2 [u,v]) prod_ty0 m ps monad wp inv)))
-      pure (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp8 (mkConst ``invariantGadget2 [u,v]) lst_ty0 prod_ty0 m ps monad wp lst inv)))
+--      logInfo (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp6 (mkConst ``invariantGadget2 [u]) prod_ty0 m ps monad wp inv)))
+      pure (mkAppRev (Expr.const n ls) (args.set! 1 (mkApp8 (mkConst ``invariantGadget2 [u]) lst_ty0 prod_ty0 m ps monad wp lst inv)))
     | _ => pure (mkAppRev (Expr.const n ls) args)
   | _, _ => pure (mkAppRev (Expr.const n ls) args)
 -- the congruent cases:
@@ -330,15 +338,19 @@ partial def elab_newdecl : CommandElab := fun decl => do
   runTermElabM fun _ => do
     lambdaTelescope defn.value fun fvars body => do
       let newBody ← patch_invariant body
+      logInfo newBody
       let finalBody ← mkLambdaFVars fvars newBody
+      logInfo finalBody
+      IO.println "before"
       addDecl (.defnDecl { defn with
         name := refinedDeclId2
         value := finalBody
       })
+      IO.println "after"
 
   let .some (.defnInfo defn) := (← getEnv).find? refinedDeclId2 | throwUnsupportedSyntax
---  dbg_trace defn.name
---  dbg_trace defn.value
+  --  dbg_trace defn.name
+  --  dbg_trace defn.value
 
   runTermElabM fun vars => do
   let rec spec_ty (call : Expr) (body : Expr) (progBinders : Nat) : (ty : Expr) → TermElabM (Expr × Expr)
@@ -377,11 +389,11 @@ partial def elab_newdecl : CommandElab := fun decl => do
     -- dbg_trace call
     let refined_triple_ty := mkApp7 (mkConst ``Triple [u]) m ps wp α call P Q
     return (refined_triple_ty, body)
-  let (refined_spec, erased_value) ← spec_ty (mkConst defn.name (defn.levelParams.map .param)) defn.value numProgBinders defn.type
-  let erased_value ← instantiateMVars erased_value
-  let erased_ty ← inferType erased_value
+  -- let (refined_spec, erased_value) ← spec_ty (mkConst defn.name (defn.levelParams.map .param)) defn.value numProgBinders defn.type
+  -- let erased_value ← instantiateMVars erased_value
+  -- let erased_ty ← inferType erased_value
 
-  --log erased_value
+  -- log erased_value
   -- withOptions (Elab.async.set · false) <|
   --   addDecl (.defnDecl { defn with
   --     name := declId
@@ -440,18 +452,16 @@ def fib_impl (n : Nat) : Idd Nat
   ensures r => r = fib_spec n
 := do
   if n = 0 then return 0
-    let mut a := 0
-    let mut b := 1
-    invariant xs => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1)
+  let mut a := 0
+  let mut b := 1
+  invariant xs => a = fib_spec xs.rpref.length ∧ b = fib_spec (xs.rpref.length + 1)
   for _ in List.range n do
-      let a' := a
-      a := b
-      b := a' + b
-    return b
+    let a' := a
+    a := b
+    b := a' + b
+  return b
 
-#print fib_impl.refined1
-#check fib_impl.refined2
---#check fib_impl.spec
+#print fib_impl.refined2
 
 -- theorem fib_triple : ⦃⌜True⌝⦄ fib_impl n ⦃⇓ r => r = fib_spec n⦄ := by
 --   unfold fib_impl

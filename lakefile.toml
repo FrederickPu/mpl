@@ -9,3 +9,7 @@ roots = ["MPL", "MPL.IO", "MPL.Experimental"]
 [[lean_lib]]
 name = "MPLTest"
 roots = ["Test"]
+
+[[require]]
+name = "Qq"
+scope = "leanprover-community"
